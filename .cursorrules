@@ -1,0 +1,62 @@
+# Project context for AI-assisted edits
+
+## What this is
+A Python port of a Snyk issue-migration correlation tool. Given a Snyk
+project, it finds the predecessor project the same repo used to live at
+before a migration (hostname change, re-import), and returns the
+predecessor's open issues indexed by an identity that survives migration
+(`attributes.key` for SCA, `fingerprint` for SAST), each with its true
+`last_introduced_at`. Purpose: let a downstream SLA/grace-period check use
+the real introduction date instead of the date Snyk assigns to the new
+project (which resets to "now" after a migration).
+
+There is no Snyk API to write `last_introduced_at` back onto an issue - this
+tool produces a separate joinable dataset instead of mutating anything in Snyk.
+
+## Architecture - preserve this split when editing
+- `models.py`, `matching.py`, `resolver.py`, `client.py`, `correlate.py`:
+  **pure logic only**. No `aiohttp`, no I/O, no network calls. Depends only
+  on `typing.Protocol` (`ProjectsClient` in resolver.py, `SnykIssuesClient`
+  in client.py) and plain dataclasses. This is the fully unit-tested layer
+  (`tests/`, 13 tests, run with `python3 -m unittest discover -s tests`,
+  no token or network needed) - keep it that way. Don't add `aiohttp`
+  imports or real HTTP calls here.
+- `snykapi.py`: the **only** file that talks to the real Snyk API.
+  Implements the Protocols above. `SnykClient` in this file is a verbatim
+  copy of the customer's existing `ear0_pharos.snyk.api.SnykClient` - if
+  editing in the customer's actual repo, delete this copy and import theirs
+  instead rather than maintaining two versions.
+- `cli.py`: wires the real adapter to the pure logic. Thin - if it starts
+  accumulating logic, that logic belongs in `correlate.py` or `resolver.py`
+  instead.
+
+## Matching rule (don't weaken this without reason)
+Repo identity = `org/repo`, normalized from `attributes.url` (strip scheme,
+host, `.git` suffix) or `attributes.display_name` (strip anything from `(`
+onward - CLI manifest suffixes look like `org/repo(main):requirements.txt`).
+Predecessor = same repo identity, **same product** (SCA/SAST don't
+cross-match), oldest `created_at` that's still older than the given project.
+
+## Known-unverified assumptions in snykapi.py (fix here first if something breaks)
+1. `display_name` as a Targets API filter param - unconfirmed against a real response.
+2. `attributes.type == "sast"` as the signal for a Snyk Code project vs.
+   anything else being SCA - unconfirmed.
+3. Projects API using `attributes.created` (not `created_at`, which is
+   confirmed correct on the Issues API from the customer's own
+   `parse_issues_data`) - unconfirmed, worth checking a real project response.
+4. `LiveResolver` only searches within one org - group/cross-org migrations
+   aren't handled.
+
+If something is wrong at runtime, it is almost certainly one of these four
+things in `snykapi.py`, not the matching/correlation logic in the other files.
+
+## Don't do this
+- Don't add a write/PATCH call for `last_introduced_at` anywhere - Snyk's
+  Issues API doesn't support it; this was already checked.
+- Don't fetch or modify the *new* project's issues from inside this tool -
+  that stays entirely on the customer's existing side, by design.
+- Don't collapse the product check out of the resolver's matching, even if
+  it looks redundant with the repo-key check - SCA and SAST projects for
+  the same repo can have different lifecycles.
+
+See `README.md` for the full narrative version of all of the above.

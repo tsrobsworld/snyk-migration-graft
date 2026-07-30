@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "snyk-migration-graft"
+version = "0.1.0"
+description = "Snyk repo migration issue correlation: predecessor project matching and issue date/id graft for pipelines."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "aiohttp>=3.9.0",
+    "pandas>=2.0.0",
+]
+
+[project.optional-dependencies]
+dev = []
+
+[project.scripts]
+snyk-correlate = "snyk_correlate.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["snyk_correlate*"]
