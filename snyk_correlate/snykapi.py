@@ -34,6 +34,7 @@ from aiohttp.client_exceptions import (
 
 from .coordinates import aggregate_last_introduced_at, _parse_dt
 from .models import SAST, SCA, Issue, ProjectSummary
+from .project_scope import project_summary_from_api
 
 logging.basicConfig()
 logger = logging.getLogger(__name__)
@@ -246,26 +247,15 @@ class SnykApiProjectsClient:
             )
             for page in pages:
                 for project in page.get("data", []):
-                    attrs = project.get("attributes", {})
                     target_attrs = (
                         project.get("relationships", {})
                         .get("target", {})
                         .get("data", {})
                         .get("attributes", {})
                     )
-                    project_type = attrs.get("type", "")
-                    product = "sast" if project_type == "sast" else "sca"
-                    summaries.append(
-                        ProjectSummary(
-                            org_id=org_id,
-                            project_id=project["id"],
-                            product=product,
-                            integration_type=attrs.get("origin"),
-                            repo_url=target_attrs.get("url"),
-                            display_name=target_attrs.get("display_name"),
-                            created_at=_parse_dt(attrs.get("created_at") or attrs.get("created")),
-                        )
-                    )
+                    # shared with fetch_project_repo_scope so both sides of a
+                    # match are built from the same fields
+                    summaries.append(project_summary_from_api(org_id, project, target_attrs))
         return summaries
 
 
@@ -289,24 +279,26 @@ class SnykApiIssuesClient:
     async def fetch_open_issues(
         self, org_id: str, project_id: str, product: Optional[str] = None
     ) -> List[Issue]:
-        """Fetch open issues; product is sca|sast|None (both)."""
-        if product == "sca":
-            return await self._fetch_by_type(org_id, project_id, SCA)
-        if product == "sast":
-            return await self._fetch_by_type(org_id, project_id, SAST)
-        sca = await self._fetch_by_type(org_id, project_id, SCA)
-        sast = await self._fetch_by_type(org_id, project_id, SAST)
-        return sca + sast
+        """Fetch open issues; product is sca|sast|None (both).
 
-    async def _fetch_by_type(self, org_id: str, project_id: str, issue_type: str) -> List[Issue]:
+        Only "sast" narrows by type. A non-SAST project also carries `license`
+        and `config` issues alongside `package_vulnerability` - filtering to
+        SCA would drop them, and they are keyed by attributes.key just the same.
+        """
+        return await self._fetch(org_id, project_id, SAST if product == "sast" else None)
+
+    async def _fetch(
+        self, org_id: str, project_id: str, issue_type: Optional[str] = None
+    ) -> List[Issue]:
         params = {
             "version": self._issues_api_version,
             "limit": "100",
             "status": "open",
-            "type": issue_type,
             "scan_item.id": project_id,
             "scan_item.type": "project",
         }
+        if issue_type:
+            params["type"] = issue_type
         pages = await self._client.get_snyk_api_async(
             f"rest/orgs/{org_id}/issues", params, retry=self._retry
         )
@@ -319,7 +311,9 @@ class SnykApiIssuesClient:
                 issues.append(
                     Issue(
                         id=raw["id"],
-                        type=issue_type,
+                        # the issue's own type, so Issue.identity picks
+                        # fingerprint vs key correctly on an unfiltered fetch
+                        type=attrs.get("type") or issue_type or SCA,
                         org_id=org_id,
                         project_id=project_id,
                         key=attrs.get("key"),
@@ -329,13 +323,12 @@ class SnykApiIssuesClient:
                     )
                 )
 
-        if issue_type == SAST:
-            sast_issues = issues
-            if sast_issues:
-                tasks = [self._fetch_fingerprint(org_id, project_id, i.key) for i in sast_issues]
-                fingerprints = await asyncio.gather(*tasks)
-                for issue, fingerprint in zip(sast_issues, fingerprints):
-                    issue.fingerprint = fingerprint
+        sast_issues = [i for i in issues if i.type == SAST]
+        if sast_issues:
+            tasks = [self._fetch_fingerprint(org_id, project_id, i.key) for i in sast_issues]
+            fingerprints = await asyncio.gather(*tasks)
+            for issue, fingerprint in zip(sast_issues, fingerprints):
+                issue.fingerprint = fingerprint
         return issues
 
     async def _fetch_fingerprint(self, org_id: str, project_id: str, issue_key: str) -> Optional[str]:

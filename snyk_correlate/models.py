@@ -39,7 +39,13 @@ class Issue:
 
 @dataclass
 class ProjectSummary:
-    """Subset of a Snyk project (+ its target) needed to find a duplicate."""
+    """Subset of a Snyk project (+ its target) needed to find a duplicate.
+
+    `product` is only sca-vs-sast, which is too coarse to identify a
+    predecessor: one repo import yields many projects (npm, dockerfile,
+    k8sconfig, terraformconfig, ...) that all collapse to "sca". Matching also
+    needs `project_type` and `target_file` - see matching.project_kind_key.
+    """
 
     org_id: str
     project_id: str
@@ -48,6 +54,8 @@ class ProjectSummary:
     repo_url: Optional[str] = None      # target attributes.url (SCM)
     display_name: Optional[str] = None  # target attributes.display_name (CLI)
     created_at: Optional[datetime] = None
+    project_type: Optional[str] = None  # attributes.type ("npm", "dockerfile", "sast", ...)
+    target_file: Optional[str] = None   # attributes.target_file ("package.json", ...)
 
 
 @dataclass

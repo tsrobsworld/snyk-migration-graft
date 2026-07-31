@@ -23,6 +23,17 @@ class ProjectRepoScope:
     project_name: Optional[str] = None
 
 
+def target_file_from_project(attrs: dict) -> str:
+    """attributes.target_file, falling back to the manifest suffix of
+    attributes.name ("org/repo(branch):path/to/manifest").
+    """
+    target_file = (attrs.get("target_file") or "").strip()
+    if target_file:
+        return target_file
+    name = attrs.get("name") or ""
+    return name.split("):", 1)[1].strip() if "):" in name else ""
+
+
 def project_summary_from_api(org_id: str, project: dict, target_attrs: dict) -> ProjectSummary:
     attrs = project.get("attributes", {})
     project_type = attrs.get("type", "")
@@ -36,6 +47,8 @@ def project_summary_from_api(org_id: str, project: dict, target_attrs: dict) -> 
         repo_url=target_attrs.get("url"),
         display_name=target_attrs.get("display_name"),
         created_at=created,
+        project_type=project_type,
+        target_file=target_file_from_project(attrs),
     )
 
 

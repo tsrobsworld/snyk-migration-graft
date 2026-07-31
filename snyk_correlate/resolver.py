@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from typing import List, Optional, Protocol, Tuple
 
-from .matching import repo_key
+from .matching import project_kind_key, repo_key
 from .models import ProjectSummary
 
 
@@ -24,6 +24,11 @@ class LiveResolver:
     and look for another project in the org sharing that key *and* the same
     product (SCA vs SAST) - a repo can have both, and they migrate/version
     independently.
+
+    The repo key is shared by every project in a repo, so it is also matched on
+    (attributes.type, attributes.target_file) - otherwise the npm project for
+    package.json happily resolves to the repo's Dockerfile or to a different
+    manifest's npm project, and no issue identity ever lines up.
 
     NOTE: only searches within org_id today. If migrations can move a repo
     to a different org (group-scoped), extend ProjectsClient to list across
@@ -46,6 +51,7 @@ class LiveResolver:
         self_key = repo_key(self_project)
         if not self_key:
             return None  # no repo/display_name to match on
+        self_kind = project_kind_key(self_project)
 
         best: Optional[ProjectSummary] = None
         for candidate in all_projects:
@@ -55,6 +61,8 @@ class LiveResolver:
                 continue  # SCA and SAST migrate/version independently
             if repo_key(candidate) != self_key:
                 continue
+            if project_kind_key(candidate) != self_kind:
+                continue  # same repo, different scan type or manifest
             if candidate.created_at is None or self_project.created_at is None:
                 continue
             if candidate.created_at >= self_project.created_at:
