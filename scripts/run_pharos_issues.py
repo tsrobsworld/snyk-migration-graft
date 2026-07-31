@@ -86,7 +86,9 @@ async def main() -> int:
 
         graft_env = os.environ.get("SNYK_APPLY_MIGRATION_GRAFT", "1").strip().lower()
         apply_graft = graft_env not in {"0", "false", "no", "off"}
-        print(f"migration_graft={'on' if apply_graft else 'off'}")
+        graft_id_env = os.environ.get("SNYK_GRAFT_ISSUE_ID", "0").strip().lower()
+        graft_predecessor_issue_id = graft_id_env in {"1", "true", "yes", "on"}
+        print(f"migration_graft={'on' if apply_graft else 'off'} graft_predecessor_issue_id={'on' if graft_predecessor_issue_id else 'off'}")
         df = await pull_issues_for_pipeline(
             client,
             api_version=api_version,
@@ -96,6 +98,7 @@ async def main() -> int:
             projects_api_version=cfg["projects_api_version"],
             code_issue_api_version=code_api_version,
             issues_limit=issues_limit,
+            graft_predecessor_issue_id=graft_predecessor_issue_id,
         )
         _print_summary(df, apply_graft)
         if output_csv:

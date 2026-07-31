@@ -23,3 +23,6 @@ venv/
 
 # OS
 .DS_Store
+
+/docs/vendoring.md
+/docs/continuation.md

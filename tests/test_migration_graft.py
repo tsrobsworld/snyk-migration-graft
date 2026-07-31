@@ -136,6 +136,40 @@ class TestMigrationGraft(unittest.TestCase):
         self.assertEqual(out.loc[1, "issue_created_at"], "2026-02-01T00:00:00+00:00")
         self.assertEqual(out.loc[1, "issue_updated_at"], "2026-02-02T00:00:00+00:00")
 
+    def test_graft_predecessor_issue_id_replaces_issue_id(self):
+        cache = {
+            ("org1", "proj-new"): ProjectMigrationIndex(
+                old_org_id="org1",
+                old_project_id="proj-old",
+                by_identity={
+                    "sca-key-1": OldIssueSnapshot(
+                        issue_id="old-uuid",
+                        created_at="2024-01-01T00:00:00+00:00",
+                        updated_at=None,
+                        last_introduced_at=None,
+                    )
+                },
+            )
+        }
+        df = pd.DataFrame(
+            [
+                {
+                    "org_id": "org1",
+                    "project_id": "proj-new",
+                    "issue_id": "new-uuid",
+                    "issue_key": "sca-key-1",
+                    "issue_type": "package_vulnerability",
+                    "issue_created_at": "2026-01-01T00:00:00+00:00",
+                    "issue_updated_at": "2026-01-02T00:00:00+00:00",
+                }
+            ]
+        )
+        out = enrich_dataframe_migration_graft(df, cache, graft_predecessor_issue_id=True)
+        self.assertEqual(out.loc[0, "issue_id"], "old-uuid")
+        self.assertEqual(out.loc[0, "issue_snyk_id_current"], "new-uuid")
+        self.assertEqual(out.loc[0, "issue_legacy_id"], "old-uuid")
+        self.assertEqual(build_issue_id_map(out), {"new-uuid": "old-uuid"})
+
 
 class TestCoordinates(unittest.TestCase):
     def test_min_last_introduced(self):

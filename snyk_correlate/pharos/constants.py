@@ -14,6 +14,7 @@ ISSUE_COLUMN_LIST = [
     "issue_updated_at",
     "issue_last_introduced_at",
     "issue_effective_severity_level",
+    "issue_snyk_id_current",
     "issue_legacy_id",
     "issue_migration_grafted",
     "issue_migration_identity",

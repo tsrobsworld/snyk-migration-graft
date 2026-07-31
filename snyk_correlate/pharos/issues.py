@@ -1,7 +1,9 @@
-"""Pharos-compatible issues pull + parse (standalone, no ear0_pharos).
+"""Reference mock of the customer's issues module — not the production integration
+surface. See snyk_correlate/pharos/README.md. Customers call migration_graft from
+their own issues.py; see repo root README.md.
 
-Group issues entry points match production; org issues used for validation and
-local dev when SNYK_GROUP_ID is unset.
+Group issues entry points match production shape; org issues used for validation
+and local dev when SNYK_GROUP_ID is unset.
 """
 
 from __future__ import annotations
@@ -179,6 +181,114 @@ async def get_all_code_issues_detail_by_issues(
     return parse_code_issue_details(await asyncio.gather(*tasks))
 
 
+async def enrich_pulled_issues_dataframe(
+    df: pd.DataFrame,
+    client: SnykClient,
+    *,
+    api_version: str,
+    apply_migration_graft: bool = True,
+    projects_api_version: str = "2024-10-15",
+    code_issue_api_version: Optional[str] = None,
+    api_call_retry: int = 3,
+    graft_predecessor_issue_id: bool = False,
+) -> pd.DataFrame:
+    """Code fingerprints + column order + optional migration graft (production call order)."""
+    logger.info("issues pulled: rows=%s", len(df))
+    if df.empty:
+        for c in ISSUE_COLUMN_LIST:
+            if c not in df.columns:
+                df[c] = None
+        return df[ISSUE_COLUMN_LIST] if ISSUE_COLUMN_LIST else df
+
+    code_version = code_issue_api_version or api_version
+    code_df = await get_all_code_issues_detail_by_issues(df, client, code_version, api_call_retry)
+    df = merge_code_issue_fingerprints(df, code_df)
+    for c in ISSUE_COLUMN_LIST:
+        if c not in df.columns:
+            df[c] = None
+    df = df[ISSUE_COLUMN_LIST]
+
+    if apply_migration_graft:
+        n_projects = df[["org_id", "project_id"]].drop_duplicates().shape[0]
+        logger.info("building migration cache for %s unique projects", n_projects)
+        df = await enrich_issues_dataframe(
+            df,
+            client,
+            api_version=projects_api_version,
+            issues_api_version=api_version,
+            graft_predecessor_issue_id=graft_predecessor_issue_id,
+        )
+    return df
+
+
+async def get_all_issue_created_between_dates(
+    group_id: str,
+    client: SnykClient,
+    created_after: str,
+    created_before: str,
+    api_version: str,
+    api_call_retry: int = 3,
+    apply_migration_graft: bool = True,
+    projects_api_version: str = "2024-10-15",
+    code_issue_api_version: Optional[str] = None,
+    max_pages: Optional[int] = None,
+    graft_predecessor_issue_id: bool = False,
+) -> pd.DataFrame:
+    """Group issues created in [created_after, created_before); same post-pull enrich as production."""
+    df = await get_group_issues(
+        group_id,
+        client,
+        api_version,
+        api_call_retry=api_call_retry,
+        param_extra={"created_after": created_after, "created_before": created_before},
+        max_pages=max_pages,
+    )
+    return await enrich_pulled_issues_dataframe(
+        df,
+        client,
+        api_version=api_version,
+        apply_migration_graft=apply_migration_graft,
+        projects_api_version=projects_api_version,
+        code_issue_api_version=code_issue_api_version,
+        api_call_retry=api_call_retry,
+        graft_predecessor_issue_id=graft_predecessor_issue_id,
+    )
+
+
+async def get_all_issue_updated_between_dates(
+    group_id: str,
+    client: SnykClient,
+    updated_after: str,
+    updated_before: str,
+    api_version: str,
+    api_call_retry: int = 3,
+    apply_migration_graft: bool = True,
+    projects_api_version: str = "2024-10-15",
+    code_issue_api_version: Optional[str] = None,
+    max_pages: Optional[int] = None,
+    graft_predecessor_issue_id: bool = False,
+) -> pd.DataFrame:
+    """Group issues updated in [updated_after, updated_before); same post-pull enrich as production."""
+    df = await get_group_issues(
+        group_id,
+        client,
+        api_version,
+        api_call_retry=api_call_retry,
+        param_extra={"updated_after": updated_after, "updated_before": updated_before},
+        max_pages=max_pages,
+    )
+    return await enrich_pulled_issues_dataframe(
+        df,
+        client,
+        api_version=api_version,
+        apply_migration_graft=apply_migration_graft,
+        projects_api_version=projects_api_version,
+        code_issue_api_version=code_issue_api_version,
+        api_call_retry=api_call_retry,
+        graft_predecessor_issue_id=graft_predecessor_issue_id,
+    )
+
+
 async def validate_group_vs_org_issue_parity(
     org_id: str,
     group_id: str,
@@ -220,6 +330,7 @@ async def pull_issues_for_pipeline(
     projects_api_version: str = "2024-10-15",
     code_issue_api_version: Optional[str] = None,
     issues_limit: Optional[int] = None,
+    graft_predecessor_issue_id: bool = False,
 ) -> pd.DataFrame:
     """Primary dev entry: group if group_id set, else org. Optional migration enrich."""
     param_extra: Dict = {}
@@ -239,25 +350,15 @@ async def pull_issues_for_pipeline(
     else:
         raise ValueError("org_id or group_id required")
 
-    logger.info("issues pulled: rows=%s", len(df))
-
-    code_version = code_issue_api_version or api_version
-    code_df = await get_all_code_issues_detail_by_issues(df, client, code_version)
-    df = merge_code_issue_fingerprints(df, code_df)
-    for c in ISSUE_COLUMN_LIST:
-        if c not in df.columns:
-            df[c] = None
-    df = df[ISSUE_COLUMN_LIST]
-
-    if apply_migration_graft:
-        logger.info("building migration cache for %s unique projects", df[["org_id", "project_id"]].drop_duplicates().shape[0])
-        df = await enrich_issues_dataframe(
-            df,
-            client,
-            api_version=projects_api_version,
-            issues_api_version=api_version,
-        )
-    return df
+    return await enrich_pulled_issues_dataframe(
+        df,
+        client,
+        api_version=api_version,
+        apply_migration_graft=apply_migration_graft,
+        projects_api_version=projects_api_version,
+        code_issue_api_version=code_issue_api_version,
+        graft_predecessor_issue_id=graft_predecessor_issue_id,
+    )
 
 
 def client_from_env() -> Tuple[SnykClient, dict]:

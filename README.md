@@ -1,221 +1,226 @@
 # snyk-migration-graft
 
-Python library for **Snyk repo migration**: match predecessor projects (GHE ↔ GHEC, re-imports) and enrich issue rows with `issue_legacy_id` and historical dates while keeping live `issue_id`.
+**Pipeline enrichment source** for Snyk repo migration: after a repo moves to a new project (hostname change, re-import), adjust bulk issue rows with predecessor **dates** and optional **issue id** handling—one row per API issue, in the customer’s existing Pharos pull.
 
-**Suggested GitHub repo name:** `snyk-migration-graft`  
-**Import package:** `snyk_correlate` (unchanged; pip name matches repo via `pyproject.toml`)
+This is **not** a standalone app or service. It is **importable Python modules** (`snyk_correlate/`) that run **inside** the customer’s scheduled `issues.py` job. Recommended delivery is **vendored source** in their monorepo ([docs/VENDORING.md](docs/VENDORING.md)), not a separate deployed “application.”
 
-Install (from repo root after clone):
 
-```bash
-pip install -e .
-```
+|                           |                                                                                     |
+| ------------------------- | ----------------------------------------------------------------------------------- |
+| **What it is**            | Reusable matching + graft logic; main entry `enrich_issues_dataframe`               |
+| **What it is not**        | Replacement for `issues.py`, SLA engine, or warehouse jobs                          |
+| **This repo (Snyk team)** | Same modules + local mock pipeline, CLI, and tests; `pip install -e .` for dev only |
+| **Customer**              | Copy `snyk_correlate/` + one hook in their `issues.py`                              |
 
-Integration guide: [docs/IMPLEMENTATION_GUIDE.md](docs/IMPLEMENTATION_GUIDE.md)
+
+Architecture: [docs/IMPLEMENTATION_GUIDE.md](docs/IMPLEMENTATION_GUIDE.md)  
+Customer wiring: [docs/CUSTOMER_INTEGRATION_snyk-info-sharing.md](docs/CUSTOMER_INTEGRATION_snyk-info-sharing.md)  
+Internal QA: [docs/INTERNAL_TESTING.md](docs/INTERNAL_TESTING.md)
 
 ---
 
-# snyk_correlate (Python port)
+
 
 ## The problem
 
-A customer's SLA/grace-period logic (e.g. 30 days to fix a critical) reads
-`attributes.last_introduced_at` off a Snyk issue. When a repo migrates to a
-new Snyk project (GitHub hostname change, re-import, etc.), Snyk has no
-record of the old project - `last_introduced_at` resets to "just now" on
-the new project, and the SLA clock silently restarts even though the
-vulnerability has existed far longer.
+SLA/grace-period logic uses issue introduction and update times. After migration, Snyk assigns new issue IDs and new timestamps on the new project. There is no Issues API write for `created_at` and `updated_at`. Correction happens in your pipeline when you load issues into the warehouse.
 
-There is **no PATCH/PUT on the Issues API** to fix this at the source
-(confirmed - the Issues API is GET-only for `coordinates`/`last_introduced_at`,
-which are computed by Snyk from actual scan history). So the correction has
-to happen in the customer's own pipeline, not in Snyk.
+---
 
-## What this does
 
-Given a project, it finds that project's **predecessor** (the project the
-repo used to live at, before it migrated) by porting the same matching rule
-used by a related tool, `match-snyk-projects`:
 
-- Normalize `attributes.url` (SCM integrations) or `attributes.display_name`
-  (CLI imports) down to `org/repo`, stripping scheme/host/`.git` suffix -
-  this is what lets a match survive a hostname change
-  (`github-enterprise.corp.com` -> `github.com`).
-- Also match on **product** (SCA vs SAST) - a repo's dependency-scan
-  project and its code-scan project migrate/version independently, so
-  matching on repo alone isn't enough.
-- Among same-repo, same-product candidates, the oldest one that predates
-  the given project is the predecessor.
+## What `migration_graft` does
 
-It then fetches that predecessor's **open issues** and returns them indexed
-by the identity that's stable across a migration:
-- `attributes.key` for SCA issues (dependency vulnerabilities)
-- `fingerprint` for SAST issues (code issues) - `attributes.key` is
-  project-scoped for SAST and does NOT survive a migration, so a second API
-  call (`code_issue_details/{key}`) is needed to get the fingerprint
+For each distinct `(org_id, project_id)` in a batch of **new** issue rows:
 
-**This tool does not touch the new project's issues at all.** The customer's
-existing issue pull stays exactly as-is; this produces a separate dataset
-they join in on their end, keyed by `key`/`fingerprint`.
+1. Resolve the **predecessor** project (same normalized repo, same product SCA/SAST, oldest `created_at` before the current project) — same rules as `match-snyk-projects` / Go `issuewrapper`.
+2. Fetch **open issues** on the predecessor and index them by stable identity:
+  - **SCA:** `issue_key` ← `attributes.key`
+  - **SAST:** `issue_fingerprint` ← code issue details (must already be on the DataFrame)
+3. **Graft** matching rows: set legacy id and predecessor `created_at`, `updated_at`, and aggregated `last_introduced_at`.
 
-## Why it's built this way (architecture rationale)
+API work scales with **unique projects**, not issue count. Your existing group/org issue pull is unchanged except for the hook below.
 
-The logic is split into two layers on purpose:
+---
 
-1. **Pure logic** (`matching.py`, `resolver.py`, `client.py`, `correlate.py`)
-   depends only on `typing.Protocol` interfaces (`ProjectsClient`,
-   `SnykIssuesClient`) and plain dataclasses. No `aiohttp`, no network, no
-   I/O. This is what's unit tested (13 tests, all passing, no token/network
-   needed) and it's what should NOT need to change once this gets wired
-   into the customer's real codebase.
-2. **Real API adapter** (`snykapi.py`) implements those Protocols against
-   actual Snyk REST endpoints. This is the layer most likely to need
-   adjustment once tested against real data (see "Known assumptions" below)
-   - and it's isolated specifically so that fixing it doesn't risk breaking
-   the matching logic.
 
-This mirrors a Go prototype of the same tool (`issuewrapper` /
-`snyk-issue-api-wrapper`) that preceded this port - same architecture,
-same test cases, same identity/matching rules, just Python now because
-that's the language of the customer's actual pipeline (`ear0_pharos`,
-built on `aiohttp`).
 
-## Where this came from / what's reused from the customer's code
+## Customer implementation (Pharos / bulk pipeline)
 
-Two files the customer shared (`api.py`, `issues.py`, from a package
-called `ear0_pharos.snyk`) revealed the real integration surface:
+**You do not replace their** `issues.py` **with this repo.** They keep `ear0_pharos.snyk.issues`: pagination, `parse_issues_data`, code details merge, date-window entry points.
 
-- Their `SnykClient` (aiohttp-based, with retry/pagination/proxy support)
-  is copied **verbatim** into `snykapi.py`. Once this is merged into their
-  repo, delete that copy and `from ear0_pharos.snyk.api import SnykClient`
-  instead - zero logic changes needed.
-- Their `parse_issues_data` extracts `issue_id`, `org_id`, `project_id`
-  (already present, from `relationships.scan_item.data.id`),
-  `issue_created_at`, `issue_updated_at` - but **not**
-  `last_introduced_at`. That's a one-line addition needed on their side
-  regardless of how this correlation piece gets wired in.
-- Their `get_all_code_issues_detail_by_issues` already does the SAST
-  fingerprint enrichment call (`code_issue_details/{issue_key}` with
-  `project_id`) - `SnykApiIssuesClient._fetch_fingerprint` in this port
-  mirrors that exact call shape.
-- Their production issue pull is **group-scoped and date-windowed**
-  (`get_all_issue_updated_between_dates` / `_created_between_dates` against
-  `rest/groups/{group_id}/issues`), not per-org. That's a bulk pull, so the
-  integration point below (Scenario A vs B) matters for how correlation
-  gets triggered per-project inside that bulk flow.
+**Recommended:** copy the `snyk_correlate` source tree into their monorepo ([docs/VENDORING.md](docs/VENDORING.md)) — no new pip/git package approval. Then call `enrich_issues_dataframe` once per pull, after SAST fingerprints are merged.
 
-## Integration point - two scenarios (still open until their fuller pipeline is seen)
+Step-by-step for the supplied `issues.py` / `api.py`: [docs/CUSTOMER_INTEGRATION_snyk-info-sharing.md](docs/CUSTOMER_INTEGRATION_snyk-info-sharing.md).
 
-**Scenario A**: if `last_introduced_at`/grace-period logic reads directly
-off the DataFrame `parse_issues_data` returns, then the natural spot is to
-run `Correlator.correlate()` per distinct `(org_id, project_id)` right
-after parsing, and join the result onto that DataFrame by `issue_key` (SCA)
-or `issue_fingerprint` (SAST) before anything reads `last_introduced_at`.
+### Pipeline order (required)
 
-**Scenario B**: if there's more machinery between parsing and where
-`last_introduced_at` is actually consumed (a transform layer, a DB write, a
-queue), the join needs to happen at that later point instead, using the
-same identity keys.
-
-**Check where `last_introduced_at` is actually *read* for the SLA decision,
-not just where issues are fetched** - that's what determines which scenario
-this is.
-
-## Layout
-
-```
-snyk_correlate/
-  models.py     - Issue, ProjectSummary, CorrelatedIssue, MigrationCorrelation (dataclasses)
-  matching.py   - normalize_repo_url, normalize_display_name, repo_key
-  resolver.py   - ProjectsClient Protocol + LiveResolver (the matching logic, live, no file dep)
-  client.py     - SnykIssuesClient Protocol
-  correlate.py  - Correlator.correlate() - the one call this whole thing is for
-  snykapi.py    - real Snyk REST implementation of both Protocols (+ SnykClient, copied from api.py)
-  cli.py        - standalone CLI wrapping all of the above
-tests/
-  test_matching.py    - repo-key normalization (hostname change, manifest suffix stripping)
-  test_resolver.py    - predecessor matching (hostname change, product isolation, oldest-wins, no-match)
-  test_correlate.py   - full correlate() flow with fake clients (no network)
+```text
+GET group/org issues → parse_issues_data → code details + merge fingerprints → enrich_issues_dataframe → downstream
 ```
 
-## How to run it
+SAST graft **must not** run before `issue_fingerprint` exists on code rows.
+
+### Hook (after code-details merge)
+
+```python
+from snyk_correlate.migration_graft import enrich_issues_dataframe
+
+if apply_migration_graft:  # default on in v4; see opt-out below
+    df = await enrich_issues_dataframe(
+        df,
+        client,  # your existing SnykClient (aiohttp)
+        api_version=projects_api_version,      # e.g. 2024-10-15
+        issues_api_version=api_version,        # e.g. 2024-05-08
+    )
+```
+
+Wire this at the end of:
+
+- `get_all_issue_created_between_dates`
+- `get_all_issue_updated_between_dates`
+- (optional) `get_all_issues_by_organization`
+
+Pass the same `client` instance you use for issue pulls. In this repo, `snykapi.SnykClient` is a standalone copy of your `api.py` for local runs; in production, `from ear0_pharos.snyk.api import SnykClient` is fine — `enrich_issues_dataframe` only needs that client’s `get_snyk_api_async` behavior.
+
+### Changes in **your** `parse_issues_data`
+
+Add `issue_last_introduced_at` from `attributes.coordinates[]` (not top-level). Use the same aggregation for new rows and for predecessor snapshots (this package uses **min** across coordinates by default — see `snyk_correlate.coordinates`).
+
+### Opt out
+
+- `apply_migration_graft=False` on your wrapper, or
+- env `SNYK_APPLY_MIGRATION_GRAFT=0` / `false` / `off` where you map env to that flag.
+
+
+
+### Row behavior (warehouse)
+
+Same row count as the API pull (one row per issue). On **match**, `issue_created_at`, `issue_updated_at`, and `issue_last_introduced_at` are overwritten from the predecessor. On **no match**, those columns stay from the current pull.
+
+#### Issue id — two options
+
+
+| Mode                              | Parameter / env                                              | On match: `issue_id` | On match: also set                                                    |
+| --------------------------------- | ------------------------------------------------------------ | -------------------- | --------------------------------------------------------------------- |
+| **A — dual column (default)**     | `graft_predecessor_issue_id=False`                           | Live (new) Snyk id   | `issue_legacy_id` = predecessor id                                    |
+| **B — predecessor in** `issue_id` | `graft_predecessor_issue_id=True` or `SNYK_GRAFT_ISSUE_ID=1` | Predecessor id       | `issue_snyk_id_current` = live id; `issue_legacy_id` = predecessor id |
+
+
+**Option A** (default hook — no extra args):
+
+```python
+df = await enrich_issues_dataframe(
+    df, client,
+    api_version=projects_api_version,
+    issues_api_version=api_version,
+)
+```
+
+**Option B:**
+
+```python
+df = await enrich_issues_dataframe(
+    df, client,
+    api_version=projects_api_version,
+    issues_api_version=api_version,
+    graft_predecessor_issue_id=True,
+)
+```
+
+
+| Outcome      | Option A                                | Option B                                    |
+| ------------ | --------------------------------------- | ------------------------------------------- |
+| **Match**    | `issue_id` new, `issue_legacy_id` old   | `issue_id` old, `issue_snyk_id_current` new |
+| **No match** | `issue_id` new, `issue_legacy_id` empty | same as A for id columns                    |
+
+
+`build_issue_id_map(df)` returns `{live_id: predecessor_id}` for grafted rows in either mode.
+
+### Columns added by graft
+
+Among others: `issue_legacy_id`, `issue_snyk_id_current` (option B only), `issue_migration_grafted`, `issue_migration_old_org_id`, `issue_migration_old_project_id`, `issue_migration_identity`. On match, `issue_created_at`, `issue_updated_at`, and `issue_last_introduced_at` are overwritten from the predecessor.
+
+Optional helper: `build_issue_id_map(df)` → `{new_issue_id: legacy_issue_id}` for grafted rows only.
+
+---
+
+
+
+## Public API (`migration_graft.py`)
+
+
+| Function                                         | Use                                                                                   |
+| ------------------------------------------------ | ------------------------------------------------------------------------------------- |
+| `enrich_issues_dataframe(df, client, …)`         | **Main entry** — build cache + apply graft; `graft_predecessor_issue_id` for option B |
+| `build_migration_cache(client, project_keys, …)` | Cache only (advanced)                                                                 |
+| `enrich_dataframe_migration_graft(df, cache)`    | Graft only when cache already built                                                   |
+| `build_issue_id_map(df)`                         | Sidecar map for joins                                                                 |
+
+
+Lower-level matching and fetch live in `matching.py`, `resolver.py`, `project_scope.py`, and `snykapi.py` (used internally by the cache builder).
+
+---
+
+
+
+## Rate limits
+
+Snyk: **1620 requests/minute/API key**. On **429**, the bundled client sleeps `SNYK_RATE_LIMIT_BACKOFF_SECONDS` (default **60**) and retries. For large pulls, keep concurrent project cache work modest (e.g. `SNYK_CONCURRENT=5` on the client).
+
+---
+
+
+
+## Tests
 
 ```bash
-pip install aiohttp
-
-# unit tests - pure logic, no token/network required
+pip install -e .
 python3 -m unittest discover -s tests -v
+```
 
-# real run, needs a Snyk token and real org/repo
+No token or network required for unit tests.
+
+---
+
+
+
+## Local end-to-end mock (not production)
+
+This repo includes a **Pharos-shaped reference pipeline** (`snyk_correlate/pharos/issues.py` + `scripts/run_pharos_issues.py`) so you can pilot without `ear0_pharos`. That is **not** what customers install into Pharos — see **[snyk_correlate/pharos/README.md](snyk_correlate/pharos/README.md)**.
+
+---
+
+
+
+## CLI (optional)
+
+Per-project debugging and parity with Go `issuewrapper`:
+
+```bash
 export SNYK_TOKEN=...
 python3 -m snyk_correlate.cli --org-id ORG --display-name acme/widgets
-python3 -m snyk_correlate.cli --org-id ORG --repo-url https://github.com/acme/widgets --project-id PROJECT_UUID
-python3 -m snyk_correlate.cli --org-id ORG --display-name acme/widgets --product sca
 ```
 
-### CLI flags
+Emits predecessor issue JSON keyed by identity; bulk Pharos flows should use `enrich_issues_dataframe` instead.
 
-| Flag | Required | Description |
-|---|---|---|
-| `--org-id` | yes | Snyk organization UUID |
-| `--display-name` | one of repo flags | Target `display_name`, e.g. `acme/widgets` |
-| `--repo-url` | one of repo flags | Repo URL; normalized to `org/repo` for the Targets API query |
-| `--project-id` | no | NEW project to correlate; auto-selects newest-per-product if omitted |
-| `--product` | no | `sca` or `sast`; narrows auto-selection when `--project-id` is omitted |
-| `--snyk-tenant` | no | API host/region (default `https://api.snyk.io`, or `SNYK_API` env var) |
-| `--snyk-api-version` | no | REST version for targets/projects (default `2024-10-15`) |
-| `--snyk-issues-api-version` | no | Issues list API version (default `2024-05-08`) |
-| `--snyk-code-issue-detail-api-version` | no | SAST fingerprint detail version (default `2024-10-14~experimental`) |
-
-**Auth:** `SNYK_TOKEN` environment variable.
-
-**Rate limits:** Snyk allows **1620 requests/minute/API key**. Over-limit calls return **429** until the **one-minute** window resets. `SnykClient` sleeps **`SNYK_RATE_LIMIT_BACKOFF_SECONDS`** (default **60**) and retries the same request (does not consume the normal 3-attempt error budget). For large org/group pulls + migration graft, keep **`SNYK_CONCURRENT`** modest (e.g. **5**) so parallel project cache builds stay under ~1620/min.
+---
 
 
-```json
-{
-  "new_org_id": "...",
-  "new_project_id": "...",
-  "match_found": true,
-  "old_org_id": "...",
-  "old_project_id": "...",
-  "product": null,
-  "issues": [
-    {
-      "identity_type": "key",
-      "identity": "...",
-      "old_issue_id": "...",
-      "old_org_id": "...",
-      "old_project_id": "...",
-      "old_created_at": "2024-01-15T00:00:00+00:00",
-      "old_last_introduced_at": "2024-01-15T00:00:00+00:00"
-    }
-  ]
-}
-```
 
-## Known assumptions - verify against real data before trusting this
+## Known assumptions (`snykapi.py`)
 
-These are the parts of `snykapi.py` most likely to need a fix once run
-against real Snyk responses (the pure logic in `matching.py`/`resolver.py`/
-`correlate.py` is fully tested and shouldn't need to change):
+Verify against real org data if something misbehaves:
 
-1. **Targets API query param** - assumed `display_name` is a valid filter
-   param on `GET /orgs/{org_id}/targets`. Confirm against a real response.
-2. **How a project's product surfaces** - assumed
-   `attributes.type == "sast"` marks a Snyk Code project, anything else is
-   treated as SCA. Check a real SCA project's `attributes.type` (a package
-   manager name like `npm`/`pip`) and a real SAST project's response to
-   confirm this holds.
-3. **`attributes.created` vs `attributes.created_at`** on the Projects API
-   - used `created` in `snykapi.py`; the Issues API (confirmed from the
-   customer's own code) uses `created_at`. These are different endpoints
-   and may not share a naming convention - verify.
-4. **Cross-org migrations** - `LiveResolver` only searches within one org.
-   If a migration can move a repo to a different org, `ProjectsClient` needs
-   to search across a group instead - not implemented here.
+1. **Targets:** do not rely on `display_name` query param (400 on some tenants); filter client-side.
+2. **Product:** SAST vs SCA from project/issue type fields.
+3. **Projects API** creation timestamp field name vs Issues API `created_at`.
+4. **Predecessor search** is within one org (not cross-org group migrations).
 
-## For Cursor / AI agents editing this repo
+---
 
-See `.cursorrules` in this directory for a condensed version of the above,
-written for quick context-loading rather than narrative reading.
+
+
+## For Cursor / agents
+
+See `.cursorrules` in this directory.

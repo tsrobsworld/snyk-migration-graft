@@ -286,7 +286,7 @@ Merge overrides into row **before** or **after** `temp_issue.update` blocks — 
 |--------|------------------|
 | **`issues.py` only** | Avoid — file already large; mixes parse + migration + async orchestration. |
 | **New package module** | **Yes** — e.g. `ear0_pharos/snyk/migration_enrichment.py` (or `migration_graft.py`). |
-| **Dependency** | Vendor or package-depend on **`snyk_correlate_py`** for resolver + issue fetch; thin Pharos wrapper for cache + graft + dataframe. |
+| **Dependency** | Vendor or package-depend on **`snyk_correlate`** for resolver + issue fetch; **vendor copy is the recommended customer delivery** ([VENDORING.md](VENDORING.md)) — thin Pharos wrapper for cache + graft + dataframe. |
 | **`issues.py` changes** | Small: Phase A columns; **`await enrich_issues_dataframe(df, client)`** at end of `get_all_issue_*` before return (graft **on by default**; pass `apply_migration_graft=False` for raw pull). |
 
 **Public API sketch:**

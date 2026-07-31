@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "snyk-migration-graft"
 version = "0.1.0"
-description = "Snyk repo migration issue correlation: predecessor project matching and issue date/id graft for pipelines."
+description = "Vendored Python modules for Snyk migration issue enrichment (predecessor matching, date/id graft in Pharos pipelines)."
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [

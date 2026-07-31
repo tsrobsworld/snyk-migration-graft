@@ -120,8 +120,18 @@ async def build_migration_cache(
     return cache
 
 
-def apply_migration_graft_row(row, cache: MigrationProjectCache) -> dict:
-    """Returns column overrides; issue_id (new) is never replaced."""
+def apply_migration_graft_row(
+    row,
+    cache: MigrationProjectCache,
+    *,
+    graft_predecessor_issue_id: bool = False,
+) -> dict:
+    """Returns column overrides.
+
+    Default: live ``issue_id`` unchanged; predecessor id in ``issue_legacy_id``.
+    When ``graft_predecessor_issue_id=True`` on a match, ``issue_id`` becomes the
+    predecessor id and the live API id is stored in ``issue_snyk_id_current``.
+    """
     org_id = row.get("org_id")
     project_id = row.get("project_id")
     idx = cache.get((org_id, project_id))
@@ -136,9 +146,8 @@ def apply_migration_graft_row(row, cache: MigrationProjectCache) -> dict:
         }
 
     old = idx.by_identity[ident]
-    new_id = row.get("issue_id")
-    _ = new_id  # issue_id on row stays the live/new id; issue_legacy_id maps predecessor
-    return {
+    live_id = row.get("issue_id")
+    out = {
         "issue_legacy_id": old.issue_id,
         "issue_created_at": old.created_at or row.get("issue_created_at"),
         "issue_updated_at": old.updated_at or row.get("issue_updated_at"),
@@ -148,6 +157,10 @@ def apply_migration_graft_row(row, cache: MigrationProjectCache) -> dict:
         "issue_migration_old_project_id": idx.old_project_id,
         "issue_migration_identity": ident,
     }
+    if graft_predecessor_issue_id:
+        out["issue_snyk_id_current"] = live_id
+        out["issue_id"] = old.issue_id
+    return out
 
 
 _GRAFT_DATE_COLUMNS = (
@@ -157,17 +170,28 @@ _GRAFT_DATE_COLUMNS = (
 )
 
 
+_GRAFT_ID_COLUMNS = ("issue_id",)
+
+
 def enrich_dataframe_migration_graft(
     df: pd.DataFrame,
     cache: MigrationProjectCache,
+    *,
+    graft_predecessor_issue_id: bool = False,
 ) -> pd.DataFrame:
     if df.empty:
         return df
     out = df.copy()
-    graft_cols = out.apply(lambda row: apply_migration_graft_row(row, cache), axis=1, result_type="expand")
+    graft_cols = out.apply(
+        lambda row: apply_migration_graft_row(
+            row, cache, graft_predecessor_issue_id=graft_predecessor_issue_id
+        ),
+        axis=1,
+        result_type="expand",
+    )
     grafted = graft_cols["issue_migration_grafted"].fillna(False).astype(bool)
     for col in graft_cols.columns:
-        if col in _GRAFT_DATE_COLUMNS:
+        if col in _GRAFT_DATE_COLUMNS or (graft_predecessor_issue_id and col in _GRAFT_ID_COLUMNS):
             out.loc[grafted, col] = graft_cols.loc[grafted, col]
         else:
             out[col] = graft_cols[col]
@@ -182,6 +206,7 @@ async def enrich_issues_dataframe(
     issues_api_version: str = "2024-05-08",
     code_issue_detail_api_version: str = "2024-10-14~experimental",
     retry: int = 3,
+    graft_predecessor_issue_id: bool = False,
 ) -> pd.DataFrame:
     """Build cache for unique projects in df, merge fingerprints must already be present for SAST."""
     if df.empty or "org_id" not in df.columns or "project_id" not in df.columns:
@@ -195,19 +220,25 @@ async def enrich_issues_dataframe(
         code_issue_detail_api_version=code_issue_detail_api_version,
         retry=retry,
     )
-    return enrich_dataframe_migration_graft(df, cache)
+    return enrich_dataframe_migration_graft(
+        df, cache, graft_predecessor_issue_id=graft_predecessor_issue_id
+    )
 
 
 def build_issue_id_map(df: pd.DataFrame) -> Dict[str, str]:
-    """new issue_id -> legacy issue_id for grafted rows."""
+    """Live (new) issue_id -> predecessor issue_id for grafted rows."""
     if df.empty or "issue_migration_grafted" not in df.columns:
         return {}
-    m = {}
+    m: Dict[str, str] = {}
     for _, row in df.iterrows():
         if not row.get("issue_migration_grafted"):
             continue
-        new_id = row.get("issue_id")
-        old_id = row.get("issue_legacy_id")
-        if new_id and old_id:
-            m[str(new_id)] = str(old_id)
+        live = row.get("issue_snyk_id_current")
+        if live:
+            pred = row.get("issue_legacy_id") or row.get("issue_id")
+        else:
+            live = row.get("issue_id")
+            pred = row.get("issue_legacy_id")
+        if live and pred:
+            m[str(live)] = str(pred)
     return m
