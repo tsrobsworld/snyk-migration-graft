@@ -15,7 +15,7 @@ from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 
-from snyk_correlate.coordinates import aggregate_last_introduced_at
+from snyk_correlate.coordinates import aggregate_last_introduced_at, to_iso_z
 from snyk_correlate.migration_graft import enrich_issues_dataframe
 from snyk_correlate.pharos.constants import CODE_ISSUE_COLUMN_LIST, ISSUE_COLUMN_LIST
 from snyk_correlate.snykapi import SnykClient
@@ -52,8 +52,10 @@ def parse_issues_data(data: List[List[Dict]], *, columns: Optional[List[str]] = 
                     "issue_type": attributes.get("type"),
                     "issue_title": attributes.get("title"),
                     "issue_status": attributes.get("status"),
-                    "issue_created_at": attributes.get("created_at"),
-                    "issue_updated_at": attributes.get("updated_at"),
+                    # normalized so a column never mixes Snyk's raw format with
+                    # a re-serialized one - see coordinates.to_iso_z
+                    "issue_created_at": to_iso_z(attributes.get("created_at")),
+                    "issue_updated_at": to_iso_z(attributes.get("updated_at")),
                     "issue_last_introduced_at": _last_introduced_iso(coordinates),
                     "issue_effective_severity_level": attributes.get("effective_severity_level"),
                 }
@@ -67,8 +69,7 @@ def parse_issues_data(data: List[List[Dict]], *, columns: Optional[List[str]] = 
 
 
 def _last_introduced_iso(coordinates: list) -> Optional[str]:
-    dt = aggregate_last_introduced_at(coordinates, use_min=True)
-    return dt.isoformat() if dt else None
+    return to_iso_z(aggregate_last_introduced_at(coordinates, use_min=True))
 
 
 def parse_code_issue_details(data: List[List[Dict]]) -> pd.DataFrame:

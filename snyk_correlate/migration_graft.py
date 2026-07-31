@@ -13,6 +13,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
 
+from .coordinates import to_iso_z
 from .models import SAST, SCA
 from .project_scope import fetch_project_repo_scope
 from .resolver import LiveResolver
@@ -20,9 +21,7 @@ from .snykapi import SnykApiIssuesClient, SnykApiProjectsClient, SnykClient
 
 
 def _iso(dt: Optional[datetime]) -> Optional[str]:
-    if dt is None:
-        return None
-    return dt.isoformat()
+    return to_iso_z(dt)
 
 
 @dataclass
@@ -195,6 +194,15 @@ def enrich_dataframe_migration_graft(
             out.loc[grafted, col] = graft_cols.loc[grafted, col]
         else:
             out[col] = graft_cols[col]
+
+    # One format for the whole column, not just the rows this graft touched.
+    # Callers build issue_created_at / issue_updated_at themselves (customers
+    # call this from their own issues.py), and Snyk's fractional precision
+    # varies between projects, so normalizing only grafted rows would still
+    # leave the column mixed.
+    for col in _GRAFT_DATE_COLUMNS:
+        if col in out.columns:
+            out[col] = out[col].map(to_iso_z)
     return out
 
 
