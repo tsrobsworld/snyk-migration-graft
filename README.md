@@ -33,10 +33,13 @@ SLA/grace-period logic uses issue introduction and update times. After migration
 
 For each distinct `(org_id, project_id)` in a batch of **new** issue rows:
 
-1. Resolve the **predecessor** project (same normalized repo, same product SCA/SAST, oldest `created_at` before the current project) — same rules as `match-snyk-projects` / Go `issuewrapper`.
+1. Resolve the **predecessor** project — oldest `created_at` before the current project among candidates matching on *all* of:
+  - same normalized repo (`repo_key`: `attributes.url` / `display_name` reduced to `org/repo`, hostname-insensitive)
+  - same product (SCA vs SAST)
+  - same **scan type and manifest** (`attributes.type` + `attributes.target_file`) — a repo import yields one project per manifest, and they all share a repo key and the `sca` product, so without this the npm project for `package.json` resolves to the repo's Dockerfile or to `frontend/package.json` and no identity lines up
 2. Fetch **open issues** on the predecessor and index them by stable identity:
-  - **SCA:** `issue_key` ← `attributes.key`
   - **SAST:** `issue_fingerprint` ← code issue details (must already be on the DataFrame)
+  - **everything else** (`package_vulnerability`, `license`, `config`): `issue_key` ← `attributes.key`. The predecessor fetch is deliberately *not* narrowed to `type=package_vulnerability` — an IaC or npm project also carries `config` and `license` issues.
 3. **Graft** matching rows: set legacy id and predecessor `created_at`, `updated_at`, and aggregated `last_introduced_at`.
 
 API work scales with **unique projects**, not issue count. Your existing group/org issue pull is unchanged except for the hook below.
