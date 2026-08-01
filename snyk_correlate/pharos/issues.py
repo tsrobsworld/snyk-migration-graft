@@ -14,6 +14,7 @@ import os
 from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
+from aiohttp.client_exceptions import ClientResponseError
 
 from snyk_correlate.coordinates import aggregate_last_introduced_at, to_iso_z
 from snyk_correlate.migration_graft import enrich_issues_dataframe
@@ -142,15 +143,23 @@ async def resolve_org_id_for_group(
     orgs_api_version: str = "2024-10-15",
     api_call_retry: int = 3,
 ) -> str:
+    """Pick any org in the group (parity helper). Prefer SNYK_ORG_ID or org_id on issue rows."""
     if org_id:
         return org_id
     for version in (orgs_api_version, "2024-05-08", "2023-05-29"):
         try:
             pages = await client.get_snyk_api_async(
                 f"rest/groups/{group_id}/orgs",
-                {"version": version, "limit": "1"},
+                {"version": version, "limit": "100"},
                 retry=api_call_retry,
             )
+        except ClientResponseError as exc:
+            logger.info(
+                "group orgs list unavailable (version=%s, status=%s); use org_id from issues or SNYK_ORG_ID",
+                version,
+                exc.status,
+            )
+            continue
         except Exception as exc:
             logger.debug("group orgs lookup failed version=%s: %s", version, exc)
             continue

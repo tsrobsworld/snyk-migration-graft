@@ -62,11 +62,7 @@ async def main() -> int:
 
     async with client:
         if group_id and issues_limit is not None:
-            org_for_parity = org_id or await resolve_org_id_for_group(
-                client,
-                group_id,
-                orgs_api_version=cfg["projects_api_version"],
-            )
+            org_for_parity = org_id
             if not org_for_parity:
                 preview = await get_group_issues(
                     group_id,
@@ -77,6 +73,12 @@ async def main() -> int:
                 )
                 if not preview.empty and preview["org_id"].notna().any():
                     org_for_parity = str(preview["org_id"].dropna().iloc[0])
+            if not org_for_parity:
+                org_for_parity = await resolve_org_id_for_group(
+                    client,
+                    group_id,
+                    orgs_api_version=cfg["projects_api_version"],
+                )
             if org_for_parity:
                 await validate_group_vs_org_issue_parity(
                     org_for_parity, group_id, client, api_version, sample_limit=min(issues_limit, 100)
